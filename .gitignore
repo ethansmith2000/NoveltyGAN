@@ -1,0 +1,12 @@
+*.parquet
+images
+*cpython*
+*.log
+wandb
+model-output
+checkpoint*
+checkpoint-*
+__pycache__
+*.parquet*
+*.csv
+data
