@@ -39,10 +39,37 @@ from tqdm import tqdm
 import numpy as np
 
 import pandas as pd
-from pipeline import StableDiffusionRLCFGPipeline
 
 import models
 from models import UNetDensityEstimator, Discriminator
+
+
+from diffusers import UNet2DModel
+from torch.optim import Adam
+from tqdm import tqdm
+import math
+import re
+
+def get_model():
+    block_out_channels=(128, 128, 256, 256, 512, 512)
+    down_block_types=( 
+        "DownBlock2D",  # a regular ResNet downsampling block
+        "DownBlock2D", 
+        "DownBlock2D", 
+        "DownBlock2D", 
+        "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+        "DownBlock2D",
+    )
+    up_block_types=(
+        "UpBlock2D",  # a regular ResNet upsampling block
+        "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+        "UpBlock2D", 
+        "UpBlock2D", 
+        "UpBlock2D", 
+        "UpBlock2D"  
+    )
+    return UNet2DModel(block_out_channels=block_out_channels,out_channels=3, in_channels=3, up_block_types=up_block_types, down_block_types=down_block_types, add_attention=True)
+
 
 
 def collate_fn(examples):
@@ -57,6 +84,12 @@ def collate_fn(examples):
     }
 
     return batch
+
+
+def enable_gradient_checkpointing(model):
+    for n, m in model.named_modules():
+        if m.__class__.__name__.lower() == "upblock2d":
+            m.gradient_checkpointing = True
 
 
 
@@ -135,9 +168,6 @@ def unwrap_model(accelerator, model):
 @torch.no_grad()
 def log_validation(
     generator,
-    vae,
-    tokenizer,
-    text_encoder,
     # scheduler,
     weight_dtype,
     args,
@@ -164,22 +194,16 @@ def log_validation(
     # run inference
     gen_seed = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
 
-    input_ids = tokenizer(args.validation_prompt, return_tensors="pt", truncation=True, padding="max_length", max_length=77).input_ids.to(accelerator.device)
-    encoder_hidden_states = text_encoder(input_ids.to(accelerator.device)).last_hidden_state
-
     with torch.cuda.amp.autocast():
         noises = torch.randn(args.num_validation_images, 4, 64, 64, device=accelerator.device, dtype=weight_dtype, generator=gen_seed)
         timesteps_clean = torch.ones(noises.shape[0]).long().to(accelerator.device)
-        pred_latents = generator(
+        image = generator(
             noises,
             timesteps_clean,
-            encoder_hidden_states,
             return_dict=False,
         )[0]
 
         # decode
-        pred_latents = pred_latents / vae.config.scaling_factor
-        image = vae.decode(pred_latents, return_dict=False)[0]
         image = image * 0.5 + 0.5
         image = image.clamp(0, 1)
         image = image.permute(0, 2, 3, 1).cpu().numpy()
@@ -252,43 +276,21 @@ def init_train_basics(args, logger):
 
 
 def load_models(args, accelerator, weight_dtype):
-    # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        use_fast=False,
-    )
-
-    # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder = transformers.CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder",
-    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", 
-    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
-
-    generator = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet",
-    ).to(accelerator.device, dtype=weight_dtype)#.requires_grad_(False)
-
-    discriminator = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet",
-    ).to(accelerator.device, dtype=weight_dtype)#.requires_grad_(False)
-
-    density_model = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet",
-    ).requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
+    # noise_scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = diffusers.DDIMScheduler(beta_schedule="linear", beta_start=0.0001, beta_end=0.02)
+    generator = get_model().to(accelerator.device, dtype=weight_dtype)#.requires_grad_(False)
+    discriminator = get_model().to(accelerator.device, dtype=weight_dtype)#.requires_grad_(False)
+    density_model = get_model().requires_grad_(False).to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
-        generator.enable_gradient_checkpointing()
-        discriminator.enable_gradient_checkpointing()
-        density_model.enable_gradient_checkpointing()
+        enable_gradient_checkpointing(generator)
+        enable_gradient_checkpointing(discriminator)
+        enable_gradient_checkpointing(density_model)
 
     discriminator = Discriminator(discriminator)
     density_model = UNetDensityEstimator(density_model, noise_scheduler)
 
-    return tokenizer, noise_scheduler, text_encoder, vae, generator, discriminator, density_model
+    return noise_scheduler, generator, discriminator, density_model
 
 
 def get_optimizer(args, lr, params_to_optimize, accelerator):
@@ -318,73 +320,11 @@ def get_optimizer(args, lr, params_to_optimize, accelerator):
     return optimizer, lr_scheduler
 
 
-def get_dataset(args, tokenizer):
-    # Dataset and DataLoaders creation:
-    train_dataset = PandasDataset(
-        dataset_path=args.dataset_path,
-        size=args.resolution,
-    )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=args.dataloader_num_workers,
-    )
-
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-
-    return train_dataset, train_dataloader, num_update_steps_per_epoch
-
-
-default_arguments = dict(
-    pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
-    dataset_path="./data/combined.parquet",
-    num_validation_images=4,
-    output_dir="model-output",
-    seed=124,
-    resolution=512,
-    train_batch_size=8,
-    max_train_steps=50_000,
-    validation_steps=250,
-    checkpointing_steps=500,
-    resume_from_checkpoint=None,
-    gradient_accumulation_steps=1,
-    gradient_checkpointing=True,
-    learning_rate_gen=2.0e-5,
-    learning_rate_disc=2.0e-5,
-    density_loss_factor=0.1,
-    lr_scheduler="linear",
-    lr_warmup_steps=500,
-    lr_num_cycles=1,
-    lr_power=1.0,
-    dataloader_num_workers=8,
-    use_8bit_adam=False,
-    adam_beta1=0.85,
-    adam_beta2=0.98,
-    adam_weight_decay=1e-2,
-    adam_epsilon=1e-08,
-    max_grad_norm=1.0,
-    report_to="wandb",
-    mixed_precision="bf16",
-    allow_tf32=True,
-    logging_dir="logs",
-    local_rank=-1,
-    num_processes=1,
-    use_wandb=True,
-    gan_loss_type="hing"
-)
-
-
-def resume_model(unet, path, accelerator):
+def resume_model(model, path, accelerator):
     accelerator.print(f"Resuming from checkpoint {path}")
-    global_step = int(path.split("-")[-1])
+    global_step = int(re.findall(r"\d+", path)[-1])
     state_dict = torch.load(path, map_location="cpu")
-
-    unet.reward_emb = torch.nn.Parameter(state_dict["token"].to(accelerator.device))
+    model.load_state_dict(state_dict)
 
     return global_step
 

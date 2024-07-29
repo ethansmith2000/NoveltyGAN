@@ -29,15 +29,61 @@ from train_utils import (
     log_validation,
     save_model,
     unwrap_model,
-    default_arguments,
     load_models,
     get_optimizer,
-    get_dataset,
     more_init,
     resume_model,
 )
 from types import SimpleNamespace
 from types import MethodType
+
+import torch
+import torchvision
+from torchvision import transforms
+from diffusers import UNet2DModel
+from torch.optim import Adam
+from tqdm import tqdm
+import math
+
+
+default_arguments = dict(
+    pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
+    dataset_path="./data/combined.parquet",
+    num_validation_images=4,
+    output_dir="model-output",
+    seed=124,
+    resolution=512,
+    train_batch_size=8,
+    max_train_steps=50_000,
+    validation_steps=250,
+    checkpointing_steps=500,
+    resume_from_checkpoint=None,
+    gradient_accumulation_steps=1,
+    gradient_checkpointing=True,
+    learning_rate_gen=2.0e-5,
+    learning_rate_disc=2.0e-5,
+    density_loss_factor=0.1,
+    lr_scheduler="linear",
+    lr_warmup_steps=500,
+    lr_num_cycles=1,
+    lr_power=1.0,
+    dataloader_num_workers=8,
+    use_8bit_adam=False,
+    adam_beta1=0.9,
+    adam_beta2=0.98,
+    adam_weight_decay=1e-2,
+    adam_epsilon=1e-08,
+    max_grad_norm=1.0,
+    report_to="wandb",
+    mixed_precision="bf16",
+    allow_tf32=True,
+    logging_dir="logs",
+    local_rank=-1,
+    num_processes=1,
+    use_wandb=True,
+    gan_loss_type="hinge"
+)
+
 
 
 def get_discriminator_loss(real_predictions, fake_predictions, gan_loss_type="hinge"):
@@ -52,9 +98,11 @@ def get_discriminator_loss(real_predictions, fake_predictions, gan_loss_type="hi
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
         discrim_loss = -F.logsigmoid(real_rel).mean() - F.logsigmoid(1 - fake_rel).mean()
-    else:
+    elif gan_loss_type = "regular":
         discrim_loss = (F.binary_cross_entropy_with_logits(real_predictions, torch.ones_like(real_predictions)) \
                         + F.binary_cross_entropy_with_logits(fake_predictions, torch.zeros_like(fake_predictions)))
+    else:
+        raise f"invalid loss type: {gan_loss_type}" 
 
     return discrim_loss
 
@@ -65,26 +113,22 @@ def get_generator_loss(fake_predictions, real_predictions, gan_loss_type="hinge"
     elif gan_loss_type == "relative-hinge":
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
-        gen_loss = F.relu(1 + real_rel).mean(0) + F.relu(1 - fake_rel).mean(0)
-        gen_loss = gen_loss.mean()
+        gen_loss = F.relu(1 - fake_rel).mean()
     elif gan_loss_type == "relative":
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
-        gen_loss = -F.logsigmoid(1 - real_rel).mean() - F.logsigmoid(fake_rel).mean()
-    else:
+        gen_loss = -F.logsigmoid(fake_rel).mean()
+    elif gan_loss_type == "regular":
         gen_loss = F.binary_cross_entropy_with_logits(fake_predictions, torch.ones_like(fake_predictions))
+    else:
+        raise f"invalid loss type: {gan_loss_type}" 
 
     return gen_loss
 
 
 @torch.no_grad()
-def prepare_batch(batch, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype, ):
-    # # Get the text embedding for conditioning
-    input_ids = tokenizer(batch["text"], return_tensors="pt", padding="max_length", truncation=True, max_length=77).input_ids
-    encoder_hidden_states = text_encoder(input_ids.to(text_encoder.device),return_dict=False,)[0]
-
-    # 
-    clean_latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
+def prepare_batch(batch, noise_scheduler, weight_dtype):
+    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
     timesteps_clean = torch.zeros(clean_latents.shape[0], device=clean_latents.device).long()
     noise = torch.randn_like(clean_latents)
     timesteps = torch.randint(
@@ -92,25 +136,28 @@ def prepare_batch(batch, tokenizer, text_encoder, noise_scheduler, vae, weight_d
     ).long()
     noisy_latents = noise_scheduler.add_noise(clean_latents, noise, timesteps)
 
+    return clean_latents, noisy_latents, timesteps, timesteps_clean
 
-    return clean_latents, noisy_latents, timesteps, timesteps_clean, encoder_hidden_states
 
 def train(args):
     logger = get_logger(__name__)
     args = SimpleNamespace(**args)
-    args.validation_prompt = [f"majestic fantasy painting", f"a comic book drawing", f"HD cinematic photo", f"oil painting"]
     accelerator, weight_dtype = init_train_basics(args, logger)
 
-    tokenizer, noise_scheduler, text_encoder, vae, generator, discriminator, density_model = load_models(args, accelerator, weight_dtype)
+    noise_scheduler, generator, discriminator, density_model = load_models(args, accelerator, weight_dtype)
 
     # Optimizer creation
     optimizer_gen, lr_scheduler_gen = get_optimizer(args, args.learning_rate_gen, list(generator.parameters()), accelerator)
     optimizer_disc, lr_scheduler_disc = get_optimizer(args, args.learning_rate_disc, list(discriminator.parameters()), accelerator)
-    train_dataset, train_dataloader, num_update_steps_per_epoch = get_dataset(args, tokenizer)
+
+    dataset = torchvision.datasets.OxfordIIITPet(root='./datasets/OxfordIIITPet/', split='trainval', download=True, transform=transform)
+    sampler = torch.utils.data.RandomSampler(dataset, replacement=True, num_samples=len(dataset))
+    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=64, num_workers=0, drop_last=True, sampler=sampler)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
 
     # Prepare everything with our `accelerator`.
-    generator, discriminator, text_encoder, optimizer_gen, lr_scheduler_gen, optimizer_disc, lr_scheduler_disc, train_dataloader = accelerator.prepare(
-        generator, discriminator, text_encoder, optimizer_gen, lr_scheduler_gen, optimizer_disc, lr_scheduler_disc, train_dataloader
+    generator, discriminator, optimizer_gen, lr_scheduler_gen, optimizer_disc, lr_scheduler_disc, train_dataloader = accelerator.prepare(
+        generator, discriminator, optimizer_gen, lr_scheduler_gen, optimizer_disc, lr_scheduler_disc, train_dataloader
     )
 
     global_step = -1
@@ -129,9 +176,8 @@ def train(args):
         discriminator.train()
         for step, batch in enumerate(train_dataloader):
             with torch.no_grad():
-                clean_latents, noisy_latents, timesteps, timesteps_clean, encoder_hidden_states = prepare_batch(batch, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype)
+                clean_latents, noisy_latents, timesteps, timesteps_clean = prepare_batch(batch, noise_scheduler, weight_dtype)
                 noises = torch.randn_like(clean_latents)
-
 
             if step % 2 == 0:
                 with accelerator.accumulate(discriminator):
@@ -140,14 +186,12 @@ def train(args):
                         pred_latents = generator(
                             noises,
                             timesteps_clean,
-                            encoder_hidden_states,
                             return_dict=False,
                         )[0]
 
                     # Discriminator predictions
-                    extra_kwargs = {"encoder_hidden_states": encoder_hidden_states}
-                    real_preds = discriminator(clean_latents, timesteps_clean, extra_kwargs)
-                    fake_preds = discriminator(pred_latents, timesteps_clean, extra_kwargs)
+                    real_preds = discriminator(clean_latents, timesteps_clean)
+                    fake_preds = discriminator(pred_latents, timesteps_clean)
 
                     # Discriminator loss
                     disc_loss = get_discriminator_loss(real_preds, fake_preds, args.gan_loss_type)
@@ -162,7 +206,7 @@ def train(args):
 
                     logs["disc_loss"] = disc_loss.detach().item()
                     logs["lr"] = lr_scheduler_disc.get_last_lr()[0]
-                    logs["disc_grad_norm"] = grad_norm
+                    logs["disc_grad_norm"] = grad_norm.item()
 
             else:
                 with accelerator.accumulate(generator):
@@ -172,12 +216,11 @@ def train(args):
                     pred_latents = generator(
                         noises,
                         timesteps_clean,
-                        encoder_hidden_states,
                         return_dict=False,
                     )[0]
 
                     # Discriminator predictions
-                    fake_preds = discriminator(pred_latents, timesteps_clean, extra_kwargs)
+                    fake_preds = discriminator(pred_latents, timesteps_clean)
 
                     # Generator loss
                     gen_loss = get_generator_loss(fake_preds, real_preds, args.gan_loss_type)
@@ -185,7 +228,7 @@ def train(args):
                     # density model loss
                     # autocast
                     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
-                        density_loss = density_model(pred_latents, extra_kwargs)
+                        density_loss = density_model(pred_latents)
 
                     loss = gen_loss + density_loss * args.density_loss_factor
 
@@ -199,7 +242,7 @@ def train(args):
                     logs["gen_loss"] = gen_loss.detach().item()
                     logs["density_loss"] = density_loss.detach().item()
                     logs["lr"] = lr_scheduler_gen.get_last_lr()[0]
-                    logs["gen_grad_norm"] = grad_norm
+                    logs["gen_grad_norm"] = grad_norm.item()
 
 
             # Checks if the accelerator has performed an optimization step behind the scenes
@@ -243,4 +286,12 @@ def train(args):
 
 
 if __name__ == "__main__":
-    train(default_arguments)
+    arguments = {k: v for k, v in default_arguments.items()}
+    train(arguments)
+
+
+
+
+
+
+
