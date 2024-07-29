@@ -10,3 +10,6 @@ __pycache__
 *.parquet*
 *.csv
 data
+images
+pets-base
+datasets
