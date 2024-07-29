@@ -39,6 +39,7 @@ from tqdm import tqdm
 import numpy as np
 
 import pandas as pd
+import re
 from pipeline import StableDiffusionRLCFGPipeline
 
 import models
@@ -340,51 +341,11 @@ def get_dataset(args, tokenizer):
     return train_dataset, train_dataloader, num_update_steps_per_epoch
 
 
-default_arguments = dict(
-    pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
-    dataset_path="./data/combined.parquet",
-    num_validation_images=4,
-    output_dir="model-output",
-    seed=124,
-    resolution=512,
-    train_batch_size=8,
-    max_train_steps=50_000,
-    validation_steps=250,
-    checkpointing_steps=500,
-    resume_from_checkpoint=None,
-    gradient_accumulation_steps=1,
-    gradient_checkpointing=True,
-    learning_rate_gen=2.0e-5,
-    learning_rate_disc=2.0e-5,
-    density_loss_factor=0.1,
-    lr_scheduler="linear",
-    lr_warmup_steps=500,
-    lr_num_cycles=1,
-    lr_power=1.0,
-    dataloader_num_workers=8,
-    use_8bit_adam=False,
-    adam_beta1=0.85,
-    adam_beta2=0.98,
-    adam_weight_decay=1e-2,
-    adam_epsilon=1e-08,
-    max_grad_norm=1.0,
-    report_to="wandb",
-    mixed_precision="bf16",
-    allow_tf32=True,
-    logging_dir="logs",
-    local_rank=-1,
-    num_processes=1,
-    use_wandb=True,
-    gan_loss_type="hing"
-)
-
-
-def resume_model(unet, path, accelerator):
+def resume_model(model, path, accelerator):
     accelerator.print(f"Resuming from checkpoint {path}")
-    global_step = int(path.split("-")[-1])
+    global_step = int(re.findall(r"\d+", path)[-1])
     state_dict = torch.load(path, map_location="cpu")
-
-    unet.reward_emb = torch.nn.Parameter(state_dict["token"].to(accelerator.device))
+    model.load_state_dict(state_dict)
 
     return global_step
 

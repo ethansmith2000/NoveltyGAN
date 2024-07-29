@@ -29,7 +29,6 @@ from train_utils import (
     log_validation,
     save_model,
     unwrap_model,
-    default_arguments,
     load_models,
     get_optimizer,
     get_dataset,
@@ -38,6 +37,54 @@ from train_utils import (
 )
 from types import SimpleNamespace
 from types import MethodType
+
+import torch
+import torchvision
+from torchvision import transforms
+from diffusers import UNet2DModel
+from torch.optim import Adam
+from tqdm import tqdm
+import math
+
+
+default_arguments = dict(
+    pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
+    dataset_path="./data/combined.parquet",
+    num_validation_images=4,
+    output_dir="model-output",
+    seed=124,
+    resolution=512,
+    train_batch_size=8,
+    max_train_steps=50_000,
+    validation_steps=250,
+    checkpointing_steps=500,
+    resume_from_checkpoint=None,
+    gradient_accumulation_steps=1,
+    gradient_checkpointing=True,
+    learning_rate_gen=2.0e-5,
+    learning_rate_disc=2.0e-5,
+    density_loss_factor=0.1,
+    lr_scheduler="linear",
+    lr_warmup_steps=500,
+    lr_num_cycles=1,
+    lr_power=1.0,
+    dataloader_num_workers=8,
+    use_8bit_adam=False,
+    adam_beta1=0.9,
+    adam_beta2=0.98,
+    adam_weight_decay=1e-2,
+    adam_epsilon=1e-08,
+    max_grad_norm=1.0,
+    report_to="wandb",
+    mixed_precision="bf16",
+    allow_tf32=True,
+    logging_dir="logs",
+    local_rank=-1,
+    num_processes=1,
+    use_wandb=True,
+    gan_loss_type="hinge"
+)
+
 
 
 def get_discriminator_loss(real_predictions, fake_predictions, gan_loss_type="hinge"):
@@ -52,9 +99,11 @@ def get_discriminator_loss(real_predictions, fake_predictions, gan_loss_type="hi
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
         discrim_loss = -F.logsigmoid(real_rel).mean() - F.logsigmoid(1 - fake_rel).mean()
-    else:
+    elif gan_loss_type = "regular":
         discrim_loss = (F.binary_cross_entropy_with_logits(real_predictions, torch.ones_like(real_predictions)) \
                         + F.binary_cross_entropy_with_logits(fake_predictions, torch.zeros_like(fake_predictions)))
+    else:
+        raise f"invalid loss type: {gan_loss_type}"
 
     return discrim_loss
 
@@ -65,14 +114,15 @@ def get_generator_loss(fake_predictions, real_predictions, gan_loss_type="hinge"
     elif gan_loss_type == "relative-hinge":
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
-        gen_loss = F.relu(1 + real_rel).mean(0) + F.relu(1 - fake_rel).mean(0)
-        gen_loss = gen_loss.mean()
+        gen_loss = F.relu(1 - fake_rel).mean()
     elif gan_loss_type == "relative":
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
-        gen_loss = -F.logsigmoid(1 - real_rel).mean() - F.logsigmoid(fake_rel).mean()
-    else:
+        gen_loss = -F.logsigmoid(fake_rel).mean()
+    elif gan_loss_type == "regular":
         gen_loss = F.binary_cross_entropy_with_logits(fake_predictions, torch.ones_like(fake_predictions))
+    else:
+        raise f"invalid loss type: {gan_loss_type}"
 
     return gen_loss
 
@@ -168,6 +218,8 @@ def train(args):
                 with accelerator.accumulate(generator):
                     noises = torch.randn_like(clean_latents)
 
+                    extra_kwargs = {"encoder_hidden_states": encoder_hidden_states}
+
                     # Generator predictions
                     pred_latents = generator(
                         noises,
@@ -243,4 +295,12 @@ def train(args):
 
 
 if __name__ == "__main__":
-    train(default_arguments)
+    arguments = {k: v for k, v in default_arguments.items()}
+    train(arguments)
+
+
+
+
+
+
+
