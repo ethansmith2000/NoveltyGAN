@@ -212,7 +212,6 @@ def unet_encoder_forward(
 
 
 
-
 class DensityEstimator(abc.ABC, nn.Module):
 
     @abc.abstractmethod
@@ -342,10 +341,14 @@ class Discriminator(nn.Module):
     def __init__(self, unet):
         super().__init__()
         self.unet = unet
+        self.norm_out = nn.GroupNorm(32, 1280)
+        self.fc_out = make_linear(1280, 1)
         self.unet.up_blocks = None # remove up_blocks
         self.unet.forward = MethodType(unet_encoder_forward, self.unet)
 
     def forward(self, x, t, extra_kwargs):
         pred = self.unet(x, t, return_dict=False, **extra_kwargs)[0]
+        pred = self.norm_out(pred)
+        pred = self.fc_out(pred.permute(0, 2, 3, 1)).squeeze(-1)
         return pred
         

@@ -47,25 +47,36 @@ from tqdm import tqdm
 import math
 
 
+def get_pred_x0(xt, noise_pred, timestep, scheduler):
+    if not isinstance(timestep, torch.Tensor):
+        timestep = torch.tensor(timestep)#.to(xt.device)
+    if len(timestep.shape) == 0:
+        timestep = timestep[None]
+    alpha_prod_t = scheduler.alphas_cumprod[timestep]
+    beta_prod_t = 1 - alpha_prod_t
+    pred_x0 = (xt - beta_prod_t[:,None,None,None] ** (0.5) * noise_pred) / alpha_prod_t[:,None,None,None] ** (0.5)
+    return pred_x0
+
+
 default_arguments = dict(
     pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5",
     dataset_path="./data/combined.parquet",
     num_validation_images=4,
-    output_dir="model-output",
+    output_dir="novelty-gan",
     seed=124,
     resolution=512,
     train_batch_size=8,
     max_train_steps=50_000,
     validation_steps=250,
-    checkpointing_steps=500,
+    checkpointing_steps=2000,
     resume_from_checkpoint=None,
     gradient_accumulation_steps=1,
     gradient_checkpointing=True,
-    learning_rate_gen=2.0e-5,
-    learning_rate_disc=2.0e-5,
+    learning_rate_gen=1.0e-5,
+    learning_rate_disc=1.0e-5,
     density_loss_factor=0.1,
     lr_scheduler="linear",
-    lr_warmup_steps=500,
+    lr_warmup_steps=300,
     lr_num_cycles=1,
     lr_power=1.0,
     dataloader_num_workers=8,
@@ -89,7 +100,7 @@ default_arguments = dict(
 
 def get_discriminator_loss(real_predictions, fake_predictions, gan_loss_type="hinge"):
     if gan_loss_type == "hinge":
-        discrim_loss = (F.relu(1.0 - real_predictions).mean() + F.relu(1.0 + fake_predictions).mean())
+        discrim_loss = (F.relu(1 - real_predictions).mean() + F.relu(1 + fake_predictions).mean())
     elif gan_loss_type == "relative-hinge":
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
@@ -99,7 +110,7 @@ def get_discriminator_loss(real_predictions, fake_predictions, gan_loss_type="hi
         real_rel = real_predictions - fake_predictions.mean(dim=0, keepdim=True)
         fake_rel = fake_predictions - real_predictions.mean(dim=0, keepdim=True)
         discrim_loss = -F.logsigmoid(real_rel).mean() - F.logsigmoid(1 - fake_rel).mean()
-    elif gan_loss_type = "regular":
+    elif gan_loss_type == "regular":
         discrim_loss = (F.binary_cross_entropy_with_logits(real_predictions, torch.ones_like(real_predictions)) \
                         + F.binary_cross_entropy_with_logits(fake_predictions, torch.zeros_like(fake_predictions)))
     else:
@@ -181,21 +192,22 @@ def train(args):
             with torch.no_grad():
                 clean_latents, noisy_latents, timesteps, timesteps_clean, encoder_hidden_states = prepare_batch(batch, tokenizer, text_encoder, noise_scheduler, vae, weight_dtype)
                 noises = torch.randn_like(clean_latents)
-
+                extra_kwargs = {"encoder_hidden_states": encoder_hidden_states}
 
             if step % 2 == 0:
                 with accelerator.accumulate(discriminator):
                     with torch.no_grad():
                         # Predict the noise residual
-                        pred_latents = generator(
+                        noise_pred = generator(
                             noises,
                             timesteps_clean,
                             encoder_hidden_states,
                             return_dict=False,
                         )[0]
 
+                    pred_latents = get_pred_x0(noises, noise_pred, timesteps_clean, noise_scheduler)
+
                     # Discriminator predictions
-                    extra_kwargs = {"encoder_hidden_states": encoder_hidden_states}
                     real_preds = discriminator(clean_latents, timesteps_clean, extra_kwargs)
                     fake_preds = discriminator(pred_latents, timesteps_clean, extra_kwargs)
 
@@ -216,17 +228,15 @@ def train(args):
 
             else:
                 with accelerator.accumulate(generator):
-                    noises = torch.randn_like(clean_latents)
-
-                    extra_kwargs = {"encoder_hidden_states": encoder_hidden_states}
-
                     # Generator predictions
-                    pred_latents = generator(
+                    noise_pred = generator(
                         noises,
                         timesteps_clean,
                         encoder_hidden_states,
                         return_dict=False,
                     )[0]
+
+                    pred_latents = get_pred_x0(noises, noise_pred, timesteps_clean, noise_scheduler)
 
                     # Discriminator predictions
                     fake_preds = discriminator(pred_latents, timesteps_clean, extra_kwargs)
